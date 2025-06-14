@@ -1,0 +1,847 @@
+---
+title: "Wine Quality"
+author: "Hwan Cho"
+date: "2025-05-28"
+output: pdf_document
+---
+
+You typically don’t need to scale for:
+
+Decision trees
+
+Random forests
+
+Gradient boosting (e.g. XGBoost)
+
+Because they split on feature values independently, not by magnitude or distance.
+
+
+
+Yes — you should scale the numeric variables in the wine dataset, especially when training models like:
+
+Neural networks
+
+K-Nearest Neighbors (KNN)
+
+Regularized models (Ridge, LASSO)
+
+SVM because these models assume or rely on numerical feature scales being similar. When features are on vastly different scales, it can distort the model’s behavior.
+
+
+
+```{r}
+red_wine <- read.csv("winequality-red.csv", sep = ";")
+red_wine$wine_type <- 1 # 1 for red wine
+
+white_wine <- read.csv("winequality-white.csv", sep = ";")
+white_wine$wine_type <- 0 # 0 for white wine
+
+wine_combined <- rbind(red_wine, white_wine)
+head(wine_combined)
+
+wine_combined$quality_binary <- ifelse(wine_combined$quality <= 5, 0, 1)
+
+table(wine_combined$quality)
+
+# Check distribution of the new binary variable
+table(wine_combined$quality_binary)
+
+NIR <- 4113/6497 # 63.30614 %
+NIR
+# let's have 3 4 5 (classify as 0 for low quality) and 6 7 8 9 (classify for 1 for high quality) for wine quality
+```
+
+# Train/Test split 70% Train and 30% Test
+```{r}
+set.seed(123) 
+
+n <- nrow(wine_combined)
+train_idx <- sample(1:n, size = 0.7 * n)
+
+train_data <- wine_combined[train_idx, ]
+test_data  <- wine_combined[-train_idx, ]
+```
+
+# For models where scaling variables is necessary
+
+```{r}
+#-------------------------
+# 1. Define Features to Scale
+#-------------------------
+features <- c("fixed.acidity", "volatile.acidity", "citric.acid", "residual.sugar", 
+              "free.sulfur.dioxide", "total.sulfur.dioxide",
+              "density", "pH", "sulphates", "alcohol")
+
+# Don't include: quality, quality_binary, chlorides
+
+#-------------------------
+# 2. Scale Training Set
+#-------------------------
+train_scaled <- scale(train_data[, features])
+center_vals <- attr(train_scaled, "scaled:center")
+scale_vals  <- attr(train_scaled, "scaled:scale")
+
+
+# Replace original columns with scaled
+train_data_scaled <- train_data
+train_data_scaled[, features] <- train_scaled
+
+#-------------------------
+# 3. Scale Test Set using train's parameters
+#-------------------------
+test_scaled <- scale(test_data[, features], center = center_vals, scale = scale_vals)
+test_data_scaled <- test_data
+test_data_scaled[, features] <- test_scaled
+```
+
+
+
+# Feature Selection (on training set)
+```{r}
+library(MASS)
+remove_chlorides <- stepAIC(glm(quality_binary ~ . - quality - quality_binary,
+                          data = train_data,
+                          family = binomial()),
+                      direction = "both")
+
+# Step 2: Summary of final logistic model
+summary(remove_chlorides) # Remove chlorides because when we removed chlorides our AIC was lower
+```
+
+
+# Logistic Regression (Gold Standard) Don't need CV because we have no hyperparameters in logsitic regression, so found accuracy and f-1 score in our test split
+```{r}
+library(pROC)
+
+# Ensure target is a factor with levels 0 and 1
+train_data$quality_binary <- factor(train_data$quality_binary, levels = c(0, 1))
+test_data$quality_binary  <- factor(test_data$quality_binary,  levels = c(0, 1))
+
+# Refit logistic model using selected features (no chlorides)
+log_model_final <- glm(quality_binary ~ . - quality - quality_binary -chlorides,
+                       data = train_data,
+                       family = binomial())
+
+summary(log_model_final)
+
+#  Predict probabilities on test set
+pred_probs <- predict(log_model_final, newdata = test_data, type = "response")
+
+# Convert probabilities to class predictions (threshold = 0.5)
+pred_class <- ifelse(pred_probs >= 0.5, 1, 0)
+pred_class <- factor(pred_class, levels = c(0, 1))
+
+#  Confusion matrix
+conf_mat <- table(Predicted = pred_class, Actual = test_data$quality_binary)
+print(conf_mat)
+
+# Accuracy
+accuracy <- mean(pred_class == test_data$quality_binary)
+
+# F1 Score
+library(caret)
+precision <- posPredValue(pred_class, test_data$quality_binary, positive = "1")
+recall <- sensitivity(pred_class, test_data$quality_binary, positive = "1")
+f1_score <- 2 * precision * recall / (precision + recall)
+
+# Print results
+cat("Test Accuracy:", round(accuracy, 4), "\n")
+cat("Test Precision:", round(precision, 4), "\n")
+cat("Test Recall:", round(recall, 4), "\n")
+cat("Test F1 Score:", round(f1_score, 4), "\n")
+
+
+# Test Accuracy: 0.7385 
+# Test Precision: 0.7861 
+# Test Recall: 0.822 
+# Test F1 Score: 0.8037
+
+library(ROCR)
+
+# Prepare predicted probabilities and true labels
+pred <- prediction(pred_probs, test_data$quality_binary)
+
+# Get TPR vs FPR performance
+perf <- performance(pred, "tpr", "fpr")
+
+# Get AUC value
+auc  <- performance(pred, "auc")@y.values[[1]]
+
+# Plot ROC curve
+plot(perf,
+     col = "blue", 
+     lwd = 2,
+     main = "ROC Curve - Logistic Regression (TPR vs FPR)")
+
+# Diagonal reference line
+abline(0, 1, lty = 2, col = "gray")
+
+# Add legend with AUC value
+legend("bottomright",
+       legend = sprintf("AUC = %.4f", auc),
+       col = "blue", lwd = 2, bty = "n")
+
+```
+
+
+# Regression Tree/Classification Tree
+
+```{r}
+
+f1_summary <- function(data, lev = NULL, model = NULL) {
+  # Ensure predicted and observed levels match
+  if (!all(levels(data$pred) == levels(data$obs))) {
+    data$pred <- factor(data$pred, levels = levels(data$obs))
+  }
+  
+  precision <- tryCatch({
+    caret::posPredValue(data$pred, data$obs, positive = "high")
+  }, error = function(e) NA)
+  
+  recall <- tryCatch({
+    caret::sensitivity(data$pred, data$obs, positive = "high")
+  }, error = function(e) NA)
+  
+  # F1 score formula
+  f1 <- ifelse(is.na(precision) || is.na(recall) || (precision + recall) == 0,
+               NA,
+               2 * precision * recall / (precision + recall))
+  
+  # Accuracy
+  accuracy <- tryCatch({
+    caret::defaultSummary(data, lev = lev)["Accuracy"]
+  }, error = function(e) NA)
+  
+  return(c(F1 = f1, Accuracy = accuracy))
+}
+
+# Yes — you should use cross-validation to tune the tree’s complexity (cp, our hyperparameter) and prevent overfitting.
+
+# Using CV we fond that cp should be 0.00528169, has best accuracy and F1, set tuneLength to 5
+
+library(caret)
+
+# Relabel 0 and 1 to "low" and "high"
+train_data$quality_binary <- factor(train_data$quality_binary, 
+                                    levels = c(0, 1), 
+                                    labels = c("low", "high"))
+
+test_data$quality_binary <- factor(test_data$quality_binary, 
+                                   levels = c(0, 1), 
+                                   labels = c("low", "high"))
+
+ctrl <- trainControl(method = "cv",
+                     number = 10,
+                     classProbs = TRUE,
+                     summaryFunction = f1_summary)  # same as before
+
+# Train classification tree
+tree_model <- train(quality_binary ~ . - quality - quality_binary -chlorides,
+                    data = train_data,
+                    method = "rpart",
+                    metric = "Accuracy.Accuracy",
+                    trControl = ctrl, 
+                    tuneLength = 5)
+
+# View CV results
+print(tree_model)
+```
+
+```{r}
+pred_class_tree <- predict(tree_model, newdata = test_data)
+
+# Confusion matrix
+conf_mat_tree <- table(Predicted = pred_class_tree, Actual = test_data$quality_binary)
+print(conf_mat_tree)
+
+# Accuracy
+accuracy_tree <- mean(pred_class_tree == test_data$quality_binary)
+
+# F1 score components
+library(caret)
+precision_tree <- posPredValue(pred_class_tree, test_data$quality_binary, positive = "high")
+recall_tree <- sensitivity(pred_class_tree, test_data$quality_binary, positive = "high")
+f1_tree <- 2 * precision_tree * recall_tree / (precision_tree + recall_tree)
+
+# Print results
+cat("Test Accuracy (Tree):", round(accuracy_tree, 4), "\n")
+cat("Test Precision (Tree):", round(precision_tree, 4), "\n")
+cat("Test Recall (Tree):", round(recall_tree, 4), "\n")
+cat("Test F1 Score (Tree):", round(f1_tree, 4), "\n")
+
+# Test Accuracy (Tree): 0.7503 IMPROVEMENT!
+# Test Precision (Tree): 0.8135 
+# Test Recall (Tree): 0.8 
+# Test F1 Score (Tree): 0.8067  # IMPROVEMENT!
+
+
+# Visualize the final tree model
+library(rpart.plot)
+rpart.plot(tree_model$finalModel,
+           type = 2,         # label all nodes
+           extra = 104,      # show class, prob, % of obs
+           fallen.leaves = TRUE,
+           cex = 0.7)        # text size
+
+```
+
+
+```{r}
+library(ROCR)
+
+test_data$quality_binary <- ifelse(test_data$quality >= 6, 1, 0)
+test_data$quality_binary <- factor(test_data$quality_binary, levels = c(0, 1))
+
+
+# --- Logistic Regression ---
+log_probs <- predict(log_model_final, newdata = test_data, type = "response")
+pred_log  <- prediction(log_probs, test_data$quality_binary)
+perf_log  <- performance(pred_log, "tpr", "fpr")
+auc_log   <- performance(pred_log, "auc")@y.values[[1]]
+
+# --- Classification Tree ---
+tree_probs <- predict(tree_model, newdata = test_data, type = "prob")[, "high"]
+pred_tree  <- prediction(tree_probs, test_data$quality_binary)
+perf_tree  <- performance(pred_tree, "tpr", "fpr")
+auc_tree   <- performance(pred_tree, "auc")@y.values[[1]]
+
+# --- Plot both ROC curves ---
+plot(perf_log,
+     col = "blue", lwd = 2,
+     main = sprintf("ROC Curve: Logistic (%.4f) vs Tree (%.4f)", auc_log, auc_tree),
+     xlab = "False Positive Rate", ylab = "True Positive Rate")
+
+plot(perf_tree, col = "darkgreen", lwd = 2, add = TRUE)
+
+# --- Add diagonal reference line ---
+abline(0, 1, lty = 2, col = "gray")
+
+# --- Add legend with AUCs ---
+legend("bottomright",
+       legend = c(sprintf("Logistic AUC = %.4f", auc_log),
+                  sprintf("Tree AUC     = %.4f", auc_tree)),
+       col = c("blue", "darkgreen"), lwd = 2, bty = "n")
+
+
+
+```
+
+# Random Forest 
+
+The hyperparameter here is mtry where it's the number of predictor variables randomly selected at each split in a tree during the construction of a Random Forest.
+```{r}
+library(caret)
+library(randomForest)
+library(ROCR)
+
+train_data$quality_binary <- factor(train_data_scaled$quality_binary, levels = c(0,1), labels = c("low", "high"))
+test_data$quality_binary  <- factor(test_data_scaled$quality_binary,  levels = c(0,1), labels = c("low", "high"))
+
+
+
+# --- 1. Cross-validation control ---
+ctrl <- trainControl(method = "cv",
+                     number = 10,
+                     classProbs = TRUE,
+                     summaryFunction = f1_summary)
+
+# --- 2. Hyperparameter grid (mtry) ---
+rf_grid <- expand.grid(mtry = c(2, 3, 4, 6, 8))
+
+# --- 3. Train Random Forest model ---
+rf_model <- train(quality_binary ~ . - quality - quality_binary -chlorides,
+                  data = train_data,
+                  method = "rf",
+                  trControl = ctrl,
+                  tuneGrid = rf_grid,
+                  metric = "F1")
+
+rf_model # we used mtry = 6
+
+# --- 4. Predict on test set ---
+rf_pred_class <- predict(rf_model, newdata = test_data)
+rf_pred_class <- factor(rf_pred_class, levels = levels(test_data$quality_binary))  # align levels
+rf_probs <- predict(rf_model, newdata = test_data, type = "prob")[, "high"]
+
+
+# --- 5. Evaluation ---
+conf_mat_rf <- table(Predicted = rf_pred_class, Actual = test_data$quality_binary)
+accuracy_rf <- mean(rf_pred_class == test_data$quality_binary)
+precision_rf <- posPredValue(rf_pred_class, test_data$quality_binary, positive = "high")
+recall_rf <- sensitivity(rf_pred_class, test_data$quality_binary, positive = "high")
+f1_rf <- 2 * precision_rf * recall_rf / (precision_rf + recall_rf)
+
+cat("Random Forest Test Accuracy:", round(accuracy_rf, 4), "\n")
+cat("Random Forest Precision:", round(precision_rf, 4), "\n")
+cat("Random Forest Recall:", round(recall_rf, 4), "\n")
+cat("Random Forest F1 Score:", round(f1_rf, 4), "\n")
+
+
+
+# --- 6. ROC Curve ---
+# Logistic regression probs (re-run if needed)
+test_data$quality_binary <- ifelse(test_data$quality >= 6, 1, 0)
+test_data$quality_binary <- factor(test_data$quality_binary, levels = c(0, 1))
+
+
+log_probs <- predict(log_model_final, newdata = test_data, type = "response")
+
+# Build prediction objects
+pred_rf  <- prediction(rf_probs, test_data$quality_binary)
+perf_rf  <- performance(pred_rf, "tpr", "fpr")
+auc_rf   <- performance(pred_rf, "auc")@y.values[[1]]
+
+pred_log <- prediction(log_probs, test_data$quality_binary)
+perf_log <- performance(pred_log, "tpr", "fpr")
+auc_log  <- performance(pred_log, "auc")@y.values[[1]]
+
+# Plot both ROC curves
+plot(perf_log, col = "blue", lwd = 2,
+     main = "ROC Curve: Logistic vs Random Forest")
+plot(perf_rf, col = "red", lwd = 2, add = TRUE)
+abline(0, 1, lty = 2, col = "gray")
+
+# Add legend
+legend("bottomright",
+       legend = c(sprintf("Logistic AUC = %.4f", auc_log),
+                  sprintf("Random Forest AUC = %.4f", auc_rf)),
+       col = c("blue", "red"),
+       lwd = 2, bty = "n")
+
+# WOW Random forest the goat
+```
+
+# Boosting
+
+In our boosting model using the gbm method in the caret package, we tuned four key hyperparameters through cross-validation. The first is interaction.depth, which controls the maximum depth of each individual tree, with tested values of 1, 3, and 5 to capture varying levels of model complexity. The second is n.trees, representing the total number of boosting iterations or trees in the ensemble, tested at 50, 100, and 150 trees. The third is shrinkage, which refers to the learning rate—smaller values like 0.01 slow down the learning process to improve generalization, while larger values like 0.1 accelerate learning but increase the risk of overfitting. Lastly, we fixed n.minobsinnode at 10, which sets the minimum number of observations in each terminal node to prevent the model from fitting overly specific splits. This grid of parameters was explored using 10-fold cross-validation to identify the combination that maximized the F1 score.
+
+```{r}
+library(caret)
+library(gbm)
+library(ROCR)
+
+test_data$quality_binary  <- factor(test_data_scaled$quality_binary,  levels = c(0,1), labels = c("low", "high"))
+
+
+ctrl <- trainControl(method = "cv",
+                     number = 10,
+                     classProbs = TRUE,
+                     summaryFunction = f1_summary)
+
+boost_grid <- expand.grid(interaction.depth = c(1, 3, 5, 7, 9, 11, 13, 15, 17),
+                          n.trees = c(50, 100, 150, 200, 250, 300, 350, 400),
+                          shrinkage = c(0.01, 0.1, 0.5),
+                          n.minobsinnode = 10)
+
+boost_model <- train(quality_binary ~ . - quality - quality_binary - chlorides,
+                     data = train_data,
+                     method = "gbm",
+                     trControl = ctrl,
+                     tuneGrid = boost_grid,
+                     metric = "F1",
+                     verbose = FALSE)
+
+boost_model 
+
+# n.mino constant at 10
+# n.trees = 150
+# interaction dpeth = 5
+# shrinkage = 0.1
+
+#-------------------------
+# 5. Predict & Evaluate Boosting
+#-------------------------
+pred_class_boost <- predict(boost_model, newdata = test_data)
+boost_probs <- predict(boost_model, newdata = test_data, type = "prob")[, "high"]
+
+# Ensure matching factor levels
+pred_class_boost <- factor(pred_class_boost, levels = c("low", "high"))
+
+# Accuracy Metrics
+
+
+accuracy_boost <- mean(pred_class_boost == test_data$quality_binary)
+precision_boost <- posPredValue(pred_class_boost, test_data$quality_binary, positive = "high")
+recall_boost <- sensitivity(pred_class_boost, test_data$quality_binary, positive = "high")
+f1_boost <- 2 * precision_boost * recall_boost / (precision_boost + recall_boost)
+
+cat("Boosting Accuracy:", round(accuracy_boost, 4), "\n")
+cat("Boosting Precision:", round(precision_boost, 4), "\n")
+cat("Boosting Recall:", round(recall_boost, 4), "\n")
+cat("Boosting F1 Score:", round(f1_boost, 4), "\n")
+
+
+# Boosting Accuracy: 0.7821 
+# Boosting Precision: 0.8288 
+# Boosting Recall: 0.8386 
+# Boosting F1 Score: 0.8337
+
+
+library(ROCR)
+
+# --- 1. Logistic Regression Probabilities ---
+log_probs <- predict(log_model_final, newdata = test_data, type = "response")
+pred_log <- prediction(log_probs, test_data$quality_binary)
+perf_log <- performance(pred_log, "fpr", "tpr")
+auc_log  <- performance(pred_log, "auc")@y.values[[1]]
+
+
+# --- 2. Boosting Probabilities ---
+boost_probs <- predict(boost_model, newdata = test_data, type = "prob")[, "low"]
+
+pred_boost <- prediction(boost_probs, test_data$quality_binary)
+perf_boost <- performance(pred_boost, "tpr", "fpr")
+auc_boost  <- performance(pred_boost, "auc")@y.values[[1]]
+
+# --- 3. Plot ROC Curve ---
+plot(perf_log, col = "blue", lwd = 2,
+     main = "ROC Curve: Logistic Regression vs Boosting",
+     xlim = c(0, 1), ylim = c(0, 1))
+plot(perf_boost, col = "darkorange", lwd = 2, add = TRUE)
+abline(0, 1, lty = 2, col = "gray")
+
+legend("bottomright",
+       legend = c(sprintf("Logistic AUC = %.4f", 1 - auc_log),
+                  sprintf("Boosting AUC = %.4f", auc_boost)),
+       col = c("blue", "darkorange"),
+       lwd = 2, bty = "n")
+```
+
+
+# Neural Network
+
+The hyperparamters for NN are size = 7 and decay = 0.1
+```{r}
+library(caret)
+library(nnet)
+
+# Convert outcome to a factor (very important for classification!)
+train_data_scaled$quality_binary <- factor(train_data_scaled$quality_binary, levels = c(0,1), labels = c("low", "high"))
+test_data_scaled$quality_binary  <- factor(test_data_scaled$quality_binary,  levels = c(0,1), labels = c("low", "high"))
+
+
+#-------------------------
+# 4. Cross-Validation Setup
+#-------------------------
+ctrl <- trainControl(method = "cv",
+                     number = 10,
+                     classProbs = TRUE,
+                     summaryFunction = f1_summary)
+
+nn_grid <- expand.grid(size = c(3, 5, 7, 9, 11), decay = c(0.001, 0.01, 0.1))
+
+#-------------------------
+# 5. Train Neural Network on Scaled Data
+#-------------------------
+nn_model <- train(quality_binary ~ . - quality - quality_binary -chlorides,
+                  data = train_data_scaled,
+                  method = "nnet",
+                  metric = "F1",
+                  tuneGrid = nn_grid,
+                  trControl = ctrl,
+                  trace = FALSE,
+                  maxit = 200)
+
+nn_model
+
+#-------------------------
+# 6. Predict on Scaled Test Set
+#-------------------------
+pred_class_nn <- predict(nn_model, newdata = test_data_scaled)
+
+#-------------------------
+# 7. Evaluate Performance
+#-------------------------
+conf_mat_nn <- table(Predicted = pred_class_nn, Actual = test_data_scaled$quality_binary)
+accuracy_nn <- mean(pred_class_nn == test_data_scaled$quality_binary)
+precision_nn <- posPredValue(pred_class_nn, test_data_scaled$quality_binary, positive = "high")
+recall_nn <- sensitivity(pred_class_nn, test_data_scaled$quality_binary, positive = "high")
+f1_nn <- 2 * precision_nn * recall_nn / (precision_nn + recall_nn)
+
+#-------------------------
+# 8. Output Results
+#-------------------------
+print(conf_mat_nn)
+cat("Test Accuracy (NN, Scaled):", round(accuracy_nn, 4), "\n")
+cat("Test Precision:", round(precision_nn, 4), "\n")
+cat("Test Recall:", round(recall_nn, 4), "\n")
+cat("Test F1 Score (NN, Scaled):", round(f1_nn, 4), "\n")
+
+
+# Test Accuracy (NN, Scaled): 0.7641 
+# Test Precision: 0.8054 
+# Test Recall: 0.8409 
+# Test F1 Score (NN, Scaled): 0.8228 
+
+```
+
+```{r}
+library(ROCR)
+
+test_data$quality_binary <- ifelse(test_data$quality >= 6, 1, 0)
+test_data$quality_binary <- factor(test_data$quality_binary, levels = c(0, 1))
+
+test_data_scaled$quality_binary <- ifelse(test_data_scaled$quality >= 6, 1, 0)
+test_data_scaled$quality_binary <- factor(test_data_scaled$quality_binary, levels = c(0, 1))
+
+
+# --- Logistic Regression Probabilities ---
+log_probs <- predict(log_model_final, newdata = test_data, type = "response")
+pred_log <- prediction(log_probs, test_data$quality_binary)
+perf_log <- performance(pred_log, "tpr", "fpr")
+auc_log  <- performance(pred_log, "auc")@y.values[[1]]
+
+# --- Neural Network Probabilities ---
+nn_probs <- predict(nn_model, newdata = test_data_scaled, type = "prob")[, "high"]
+pred_nn  <- prediction(nn_probs, test_data_scaled$quality_binary)
+perf_nn  <- performance(pred_nn, "tpr", "fpr")
+auc_nn   <- performance(pred_nn, "auc")@y.values[[1]]
+
+# --- Plot both ROC curves ---
+plot(perf_log,
+     col = "blue", lwd = 2,
+     main = "ROC Curve: Logistic vs Neural Network")
+
+plot(perf_nn,
+     col = "purple", lwd = 2, add = TRUE)
+
+abline(0, 1, lty = 2, col = "gray")
+
+legend("bottomright",
+       legend = c(sprintf("Logistic AUC = %.4f", auc_log),
+                  sprintf("Neural Net AUC = %.4f", auc_nn)),
+       col = c("blue", "purple"),
+       lwd = 2, bty = "n")
+
+```
+# KNN
+
+Hyperparamter used k = 63, common rule of thumb is sqrt(n) which was 67.43145, but I ran cross validation to check odd numbers from 1 to 69 and found 63 was best.
+
+```{r}
+library(caret)
+library(class)
+library(ROCR)
+
+test_data_scaled$quality_binary  <- factor(test_data_scaled$quality_binary,  levels = c(0,1), labels = c("low", "high"))
+
+#-------------------------
+# 2. Cross-Validation Setup
+#-------------------------
+ctrl <- trainControl(method = "cv",
+                     number = 10,
+                     classProbs = TRUE,
+                     summaryFunction = f1_summary)
+
+#-------------------------
+# 3. Tune Hyperparameters (k)
+#-------------------------
+knn_grid <- expand.grid(k = seq(3, 69, 2))  # try odd values to avoid ties
+
+sqrt(length(train_data_scaled$fixed.acidity)) # sqrt(n) for training set is common rule of thumb 67.43145
+
+#-------------------------
+# 4. Train KNN Classifier
+#-------------------------
+knn_model <- train(quality_binary ~ . - quality - quality_binary -chlorides,
+                   data = train_data_scaled,
+                   method = "knn",
+                   metric = "F1",
+                   tuneGrid = knn_grid,
+                   trControl = ctrl)
+
+knn_model # used k = 63
+
+#-------------------------
+# 5. Predict on Test Set
+#-------------------------
+pred_class_knn <- predict(knn_model, newdata = test_data_scaled)
+
+#-------------------------
+# 6. Evaluate Performance
+#-------------------------
+conf_mat_knn <- table(Predicted = pred_class_knn, Actual = test_data_scaled$quality_binary)
+accuracy_knn <- mean(pred_class_knn == test_data_scaled$quality_binary)
+precision_knn <- posPredValue(pred_class_knn, test_data_scaled$quality_binary, positive = "high")
+recall_knn <- sensitivity(pred_class_knn, test_data_scaled$quality_binary, positive = "high")
+f1_knn <- 2 * precision_knn * recall_knn / (precision_knn + recall_knn)
+
+#-------------------------
+# 7. Output Results
+#-------------------------
+print(conf_mat_knn)
+cat("Test Accuracy (KNN, Scaled):", round(accuracy_knn, 4), "\n")
+cat("Test Precision:", round(precision_knn, 4), "\n")
+cat("Test Recall:", round(recall_knn, 4), "\n")
+cat("Test F1 Score (KNN, Scaled):", round(f1_knn, 4), "\n")
+
+
+# Test Accuracy (KNN, Scaled): 0.7646 
+# Test Precision: 0.789 
+# Test Recall: 0.8717 
+# Test F1 Score (KNN, Scaled): 0.8283 
+
+#-------------------------
+# 8. ROC Curve for KNN
+#-------------------------
+
+knn_probs <- predict(knn_model, newdata = test_data_scaled, type = "prob")[, "low"]
+pred_knn <- prediction(knn_probs, test_data_scaled$quality_binary)
+perf_knn <- performance(pred_knn, "tpr", "fpr")
+auc_knn  <- performance(pred_knn, "auc")@y.values[[1]]
+
+
+# Add to ROC plot
+plot(perf_log, col = "blue", lwd = 2, main = "ROC Curve: Logistic vs KNN", ylim = c(0,1), xlim = c(0,1))
+plot(perf_knn, col = "green", lwd = 2, add = TRUE)
+abline(0, 1, lty = 2, col = "gray")
+legend("bottomright",
+       legend = c(sprintf("Neural Net AUC = %.4f", auc_log),
+                  sprintf("KNN AUC = %.4f", auc_knn)),
+       col = c("blue", "green"), lwd = 2, bty = "n")
+```
+
+# SVM
+
+2 hyperparameters.
+Tuning paramter sigma = 0.01, and C = 10
+
+```{r}
+library(caret)
+library(e1071)
+library(ROCR)
+
+#-------------------------
+# 2. Cross-Validation Setup
+#-------------------------
+ctrl <- trainControl(method = "cv",
+                     number = 10,
+                     classProbs = TRUE,
+                     summaryFunction = f1_summary)
+
+#-------------------------
+# 3. SVM Training (on Scaled Data)
+#-------------------------
+svm_grid <- expand.grid(C = c(0.1, 1, 10), sigma = 0.01)
+
+svm_model <- train(quality_binary ~ . - quality - quality_binary - chlorides,
+                   data = train_data_scaled,
+                   method = "svmRadial",
+                   trControl = ctrl,
+                   tuneGrid = svm_grid,
+                   metric = "F1",
+                   preProcess = NULL)  # already scaled!
+
+svm_model
+
+#-------------------------
+# 4. Predict & Evaluate
+#-------------------------
+pred_class_svm <- predict(svm_model, newdata = test_data_scaled)
+svm_probs <- predict(svm_model, newdata = test_data_scaled, type = "prob")[, "high"]
+
+# Ensure level consistency
+pred_class_svm <- factor(pred_class_svm, levels = c("low", "high"))
+test_data_scaled$quality_binary <- factor(test_data_scaled$quality_binary, levels = c("low", "high"))
+
+# Metrics
+accuracy_svm <- mean(pred_class_svm == test_data_scaled$quality_binary)
+precision_svm <- posPredValue(pred_class_svm, test_data_scaled$quality_binary, positive = "high")
+recall_svm <- sensitivity(pred_class_svm, test_data_scaled$quality_binary, positive = "high")
+f1_svm <- 2 * precision_svm * recall_svm / (precision_svm + recall_svm)
+
+cat("SVM Accuracy (Scaled):", round(accuracy_svm, 4), "\n")
+cat("SVM Precision:", round(precision_svm, 4), "\n")
+cat("SVM Recall:", round(recall_svm, 4), "\n")
+cat("SVM F1 Score:", round(f1_svm, 4), "\n")
+
+# SVM Accuracy (Scaled): 0.7574 
+# SVM Precision: 0.7932 
+# SVM Recall: 0.8488 
+# SVM F1 Score: 0.8201 
+
+# --- Logistic AUC (unscaled test_data) ---
+log_probs <- predict(log_model_final, newdata = test_data, type = "response")
+pred_log <- prediction(log_probs, test_data$quality_binary)
+perf_log <- performance(pred_log, "tpr", "fpr")
+auc_log  <- performance(pred_log, "auc")@y.values[[1]]
+
+# --- SVM AUC (scaled test_data) ---
+pred_svm <- prediction(svm_probs, test_data_scaled$quality_binary)
+perf_svm <- performance(pred_svm, "fpr", "tpr")
+auc_svm  <- performance(pred_svm, "auc")@y.values[[1]]
+
+# --- Plot ROC ---
+plot(perf_log, col = "blue", lwd = 2,
+     main = "ROC Curve: Logistic Regression vs SVM (Scaled)",
+     xlim = c(0, 1), ylim = c(0, 1))
+plot(perf_svm, col = "red", lwd = 2, add = TRUE)
+abline(0, 1, lty = 2, col = "gray")
+
+legend("bottomright",
+       legend = c(sprintf("Logistic AUC = %.4f", auc_log),
+                  sprintf("SVM AUC = %.4f", 1 - auc_svm)),
+       col = c("blue", "red"),
+       lwd = 2, bty = "n")
+```
+
+
+# AUC curves together and Accuracy, F-1 Scores, and AUC as a table
+
+```{r}
+
+# Plot Logistic first as base
+plot(perf_log, col = "blue", lwd = 2,
+     main = "ROC Curve Comparison: All Models",
+     xlim = c(0, 1), ylim = c(0, 1))
+
+# Overlay each model
+plot(perf_tree,  col = "darkgreen",   lwd = 2, add = TRUE)
+plot(perf_rf,    col = "forestgreen", lwd = 2, add = TRUE)
+plot(perf_boost, col = "darkorange",  lwd = 2, add = TRUE)
+plot(perf_nn,    col = "purple",      lwd = 2, add = TRUE)
+plot(perf_knn,   col = "darkred",     lwd = 2, add = TRUE)
+plot(perf_svm,   col = "red",         lwd = 2, add = TRUE)
+
+# Diagonal reference line
+abline(0, 1, lty = 2, col = "gray")
+
+# Legend
+legend("bottomright",
+       legend = c(sprintf("Logistic     AUC = %.4f", auc_log),
+                  sprintf("Tree         AUC = %.4f", auc_tree),
+                  sprintf("RandomForest AUC = %.4f", auc_rf),
+                  sprintf("Boosting     AUC = %.4f", auc_boost),
+                  sprintf("Neural Net   AUC = %.4f", auc_nn),
+                  sprintf("KNN          AUC = %.4f", auc_knn),
+                  sprintf("SVM          AUC = %.4f", 1 -auc_svm)),
+       col = c("blue", "darkgreen", "forestgreen", "darkorange", "purple", "darkred", "red"),
+       lwd = 2, bty = "n")
+
+
+
+# Create summary table
+model_results <- data.frame(
+  Model     = c("Logistic Regression", "Decision Tree", "Random Forest", "Boosting", 
+                "Neural Network", "KNN", "SVM"),
+  Accuracy  = c(accuracy, accuracy_tree, accuracy_rf, accuracy_boost, 
+                accuracy_nn, accuracy_knn, accuracy_svm),
+  F1_Score  = c(f1_score, f1_tree, f1_rf, f1_boost, f1_nn, f1_knn, f1_svm),
+  AUC       = c(auc_log, auc_tree, auc_rf, auc_boost, auc_nn, auc_knn, (1 - auc_svm))
+)
+
+
+# Round for readability
+model_results[, 2:4] <- round(model_results[, 2:4], 4)
+
+# Display table
+print(model_results)
+
+
+
+```
+
+
+
+
+
